@@ -11,7 +11,7 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       K: repo/benchmarks/kbdi_competitors
       KBDI_NO_CPU_WORKAROUND: "1"  # the generic-CPU numba workaround is for Snapdragon only
@@ -30,6 +30,8 @@ jobs:
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket|MHz|Flags" | cut -c1-200
           free -g
+          echo "THP enabled: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+          echo "THP defrag:  $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
           echo "THREADS=$(nproc)" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
@@ -42,8 +44,10 @@ jobs:
           python -m venv venv && venv/bin/pip install -q numpy==2.4.6
           venv/bin/python "$K/make_inputs.py"
           ls "$K/data"
-      - name: Build prototypes (default target, as shipped)
-        run: cargo build --release --manifest-path "$K/rust_prototypes/Cargo.toml" --target-dir build
+      - name: Build stage-2 prototypes (default target, as shipped)
+        run: |
+          cargo build --release --manifest-path "$K/rust_fast/Cargo.toml" --target-dir build
+          cargo build --release --manifest-path "$K/rust_fast/Cargo.toml" --target-dir build-mi --features mimalloc
       - name: Install xclim
         run: |
           venv/bin/pip install -q xclim==0.62.0 numba==0.68.0 llvmlite==0.50.0 numpy==2.4.6 xarray==2026.9.0 pandas==3.0.6 scipy==1.18.1 dask==2026.8.0
@@ -51,21 +55,36 @@ jobs:
       - name: Run
         run: |
           set -x
-          P=build/release/kbdi-bench-prototypes
+          F=build/release/kbdi-bench-fast
+          M=build-mi/release/kbdi-bench-fast
           run_xclim() {  # label, then harness args
             label=$1; shift
             venv/bin/python "$K/xclim/harness.py" "$@" --timings "out-$label.jsonl" 2>&1 | tail -1 | sed "s/^/[$label] /"
           }
-          for w in station_10958 grid_2500x3650; do
-            for v in daymajor_hoist cellmajor_hoist; do
-              $P --workload "$K/data/$w" --variant $v --timings out.jsonl 2>&1 | tail -1
-            done
+          fast() {  # binary, workload, variant, [threads]
+            "$1" --workload "$K/data/$2" --variant "$3" --threads "${4:-1}" --timings out.jsonl 2>&1 | tail -1
+          }
+          for w in station_1825 station_10958; do
+            for v in production ref_cm cm_scalar cm_scanf8; do fast $F $w $v; done
             run_xclim plain --workload "$K/data/$w" --variant kernel
           done
-          for v in daymajor_hoist_mt cellmajor_hoist_mt; do
-            $P --workload "$K/data/grid_2500x3650" --variant $v --threads "$THREADS" --timings out.jsonl 2>&1 | tail -1
+          for w in grid_400x3650 grid_2500x3650; do
+            for v in production ref_dm cm_lanes8 dm_tiled_256x32; do fast $F $w $v; done
+            fast $M $w cm_lanes8
+            run_xclim plain --workload "$K/data/$w" --variant kernel
+            for v in cm_lanes8_mtp dm_tiled_256x32_mtp cm_lanes8_mtb dm_tiled_256x32_mtb; do fast $F $w $v "$THREADS"; done
+            fast $M $w cm_lanes8_mtp "$THREADS"
+            run_xclim plain --workload "$K/data/$w" --variant kernel_threads --threads "$THREADS"
           done
-          run_xclim plain --workload "$K/data/grid_2500x3650" --variant kernel_threads --threads "$THREADS"
+      - name: Diagnostics (page commit, exp cost)
+        run: |
+          set -x
+          F=build/release/kbdi-bench-fast
+          for r in 0 1; do
+            for v in cm_lanes8 probe_fraction probe_fraction_vexp probe_lanes8; do
+              KBDI_REUSE=$r $F --workload "$K/data/grid_2500x3650" --variant $v --timings out-diag.jsonl 2>&1 | tail -1 | sed "s/^/[reuse=$r] /"
+            done
+          done
       - name: Run xclim with Intel SVML (x86 only)
         if: runner.arch == 'X64'
         run: |
