@@ -106,6 +106,45 @@ With `mimalloc`, steady state for repeated calls:
 At 12 threads with reused memory, grid_2500 moves about 219 MB in 4.3 ms
 (51 GB/s), so it is near this laptop's memory bandwidth.
 
+## Linux runners (run 38814597101 on `bench/kbdi-ci`, artifacts in `../out/ci_38814597101/`)
+
+Single run each, on shared VMs (min ≈ median except where noted). Unlike stage 1, the
+lead **does** carry over to Linux.
+
+| | x86: AMD EPYC 7763 (Zen 3), 4 vCPU, THP `always` | ARM: Neoverse-N2, 4 cores, THP `madvise` |
+|---|---|---|
+| station_1825: xclim → best | 24.8 → 12.0 µs (`cm_scanf8`): **2.1×** | 21.0 → 12.7 µs (`cm_scanf8`): **1.65×** |
+| station_10958 | 137.9 → 89.0 µs (`cm_scalar`): **1.55×** | 117.5 → 81.0 µs (`cm_scalar`): **1.45×** |
+| grid_400, 1 thread | 18.3 → 6.16 ms (`dm_tiled`): **3.0×** | 15.5 → 6.17 ms (`dm_tiled`): **2.5×** |
+| grid_2500, 1 thread | 119.8 → 41.0 ms (`cm_lanes8`, mimalloc; system 42.1): **2.9×** | 99.4 → 55.2 ms (system) / 41.9 ms (mimalloc): **1.8× / 2.4×** |
+| grid_400, 4 threads | 6.07 → 3.03 ms (`dm_tiled_mtp`): **2.0×** | 4.48 → 1.65 ms (`dm_tiled_mtp`): **2.7×** |
+| grid_2500, 4 threads | 36.7 → 19.0 ms (`cm_lanes8_mtp`): **1.9×** | 24.7 → 10.7 ms (`cm_lanes8_mtp`): **2.3×** |
+| shipped kernel, grid_2500, 1 thread | 254.5 ms | 237.5 ms |
+
+What it shows:
+
+- **The huge-page hypothesis holds.** Fresh output vs a reused buffer, grid_2500
+  `cm_lanes8`:
+  - On ARM (THP `madvise`): 55.7 vs 40.9 ms, about 27 %. Our `Vec` gets 4 KB pages
+    there, while numpy `madvise`s its large arrays, so xclim's output gets huge pages.
+  - On x86 (THP `always`, both sides get huge pages): only 43.3 vs 39.2 ms.
+
+  So in `climate-py`, the output should be allocated through numpy or `madvise`d. This
+  is worth about 25 % on ARM Linux at no cost.
+- **xclim with Intel SVML is unchanged** (grid_2500 119.7 vs 119.8 ms). SVML does not
+  explain anything.
+- **`exp` is relatively more expensive on both runners.** The fraction alone is 2.6 ns
+  per element on x86 (SSE2 baseline: 2 lanes, two scalar table loads per vector) and
+  3.3 ns on N2, vs 1.4 ns on the laptop. On x86, AVX2 dispatch is the next lever. The
+  polynomial `vexp` stays clearly worse everywhere (1.5–1.9× the table version).
+- **On stations, the time scan does not beat the short chain on Linux**
+  (`cm_scanf8` ≈ `cm_scalar`; x86 station_10958 is bimodal, min 70 µs vs median 92 µs).
+  The time-parallel version needs the faster `exp` to pay off. Dispatch for stations is
+  therefore an open choice.
+- **The shipped kernel is 2–2.6× slower than xclim on these runners.** It is a much
+  bigger gap than on the laptop, so this rewrite matters more on Linux than the laptop
+  suggested.
+
 ## Variants (`src/main.rs`, `src/kernels.rs`)
 
 | variant | layout | what |
@@ -141,12 +180,8 @@ supplies it under the feature.
 
 ## Open questions and next steps
 
-1. **Linux runners first.** Mirror `rust_fast/` into `bench/kbdi-ci` and rerun. Two
-   things to check:
-   - the x86-64 SSE2 codegen of `heat_texp` (2 lanes, no FMA);
-   - whether numpy's `madvise(MADV_HUGEPAGE)` on large arrays explains the stage-1 Linux
-     gap: xclim's output gets huge pages and our `Vec` does not. If it does, allocate the
-     output through numpy (or `madvise` it) in `climate-py`.
+1. **Linux: done** (run 38814597101; see above). Next, allocate the output through numpy
+   or `madvise(MADV_HUGEPAGE)`, and rerun after each production step.
 2. **x86 AVX2 dispatch.** Use `#[target_feature(enable = "avx2")]` plus
    `is_x86_feature_detected!`. It gives 4 lanes with the same bits, as long as FMA stays
    off.
