@@ -16,6 +16,8 @@ pub mod eto;
 pub mod fire;
 pub mod flood;
 pub mod gamma;
+mod kbdi_exp_table;
+pub mod kbdi_fast;
 pub mod lmoments;
 pub mod loglogistic;
 pub mod palmer;
