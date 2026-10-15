@@ -1,0 +1,82 @@
+name: kbdi-bench
+on:
+  push:
+    branches: [bench/kbdi-ci]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      K: repo/benchmarks/kbdi_competitors
+      KBDI_NO_CPU_WORKAROUND: "1"  # the generic-CPU numba workaround is for Snapdragon only
+      NUMBA_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bench-src
+      - uses: actions/checkout@v4
+        with:
+          repository: monocongo/climate_indices
+          ref: main
+          path: repo
+          lfs: false
+      - name: Hardware
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket|MHz|Flags" | cut -c1-200
+          free -g
+          echo "THREADS=$(nproc)" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Stage harnesses and inputs
+        run: |
+          mkdir -p "$K"
+          cp -r bench-src/bench/. "$K/"
+          python -m venv venv && venv/bin/pip install -q numpy==2.4.6
+          venv/bin/python "$K/make_inputs.py"
+          ls "$K/data"
+      - name: Build prototypes (default target, as shipped)
+        run: cargo build --release --manifest-path "$K/rust_prototypes/Cargo.toml" --target-dir build
+      - name: Install xclim
+        run: |
+          venv/bin/pip install -q xclim==0.62.0 numba==0.68.0 llvmlite==0.50.0 numpy==2.4.6 xarray==2026.9.0 pandas==3.0.6 scipy==1.18.1 dask==2026.8.0
+          venv/bin/python -m numba -s | grep -iE "svml|cpu name|cpu features" || true
+      - name: Run
+        run: |
+          set -x
+          P=build/release/kbdi-bench-prototypes
+          run_xclim() {  # label, then harness args
+            label=$1; shift
+            venv/bin/python "$K/xclim/harness.py" "$@" --timings "out-$label.jsonl" 2>&1 | tail -1 | sed "s/^/[$label] /"
+          }
+          for w in station_10958 grid_2500x3650; do
+            for v in daymajor_hoist cellmajor_hoist; do
+              $P --workload "$K/data/$w" --variant $v --timings out.jsonl 2>&1 | tail -1
+            done
+            run_xclim plain --workload "$K/data/$w" --variant kernel
+          done
+          for v in daymajor_hoist_mt cellmajor_hoist_mt; do
+            $P --workload "$K/data/grid_2500x3650" --variant $v --threads "$THREADS" --timings out.jsonl 2>&1 | tail -1
+          done
+          run_xclim plain --workload "$K/data/grid_2500x3650" --variant kernel_threads --threads "$THREADS"
+      - name: Run xclim with Intel SVML (x86 only)
+        if: runner.arch == 'X64'
+        run: |
+          venv/bin/pip install -q intel-cmplr-lib-rt
+          venv/bin/python -m numba -s | grep -iE "svml" || true
+          for w in station_10958 grid_2500x3650; do
+            venv/bin/python "$K/xclim/harness.py" --workload "$K/data/$w" --variant kernel --timings out-svml.jsonl 2>&1 | tail -1 | sed "s/^/[svml] /"
+          done
+          venv/bin/python "$K/xclim/harness.py" --workload "$K/data/grid_2500x3650" --variant kernel_threads --threads "$THREADS" --timings out-svml.jsonl 2>&1 | tail -1 | sed "s/^/[svml] /"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timings-${{ matrix.runner }}
+          path: "*.jsonl"
