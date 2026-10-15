@@ -731,7 +731,7 @@ mod tests {
                     if cell == 0 { 800.0 } else { 900.0 },
                 );
                 // complete input takes the fast path, held to the native-parity
-                // tolerance rather than bit for bit
+                // tolerance rather than bit for bit (ADR-0021)
                 assert!(within_parity(values[[day, cell]], replayed[cell].kbdi));
             }
         }
