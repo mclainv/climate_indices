@@ -1,0 +1,24 @@
+[package]
+name = "kbdi-bench-fast"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# standalone: not a member of the repository workspace
+[workspace]
+
+[dependencies]
+climate-core = { path = "../../../crates/climate-core" }
+ndarray = "0.17.2"
+mimalloc = { version = "0.1", optional = true, default-features = false }
+rayon = "1"
+
+[features]
+# global allocator experiment: caches freed large blocks across calls
+mimalloc = ["dep:mimalloc"]
+
+# the repository's release profile (Cargo.toml at the root); no target-cpu flags,
+# so the code generated is what a portable wheel would ship
+[profile.release]
+lto = "thin"
+codegen-units = 1
