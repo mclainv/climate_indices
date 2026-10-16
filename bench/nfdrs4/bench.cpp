@@ -16,6 +16,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "nfdrs4.h"
@@ -62,11 +63,10 @@ static const int kSlopeClass = 1;
 static const double kRH = 40.0, kMinRH = 20.0, kWS = 10.0;
 static const double kMC1 = 8.0, kMC10 = 9.0, kMC100 = 12.0, kMC1000 = 15.0, kFuelTempC = 20.0;
 
-static std::vector<double> run_kernel(NFDRS4& nf, const std::vector<double>& pin,
-                                      const std::vector<double>& tf, const std::vector<double>& map_in,
-                                      size_t cells, size_t days) {
-    std::vector<double> out(cells * days);
-    for (size_t c = 0; c < cells; c++) {
+static void run_cells(NFDRS4& nf, const std::vector<double>& pin, const std::vector<double>& tf,
+                      const std::vector<double>& map_in, size_t c0, size_t c1, size_t days,
+                      std::vector<double>& out) {
+    for (size_t c = c0; c < c1; c++) {
         nf.SetStartKBDI(0);   // KBDI = YKBDI = StartKBDI = 0
         nf.CummPrecip = 0.0;  // empty wet spell (Init does the same)
         const double* p = &pin[c * days];
@@ -80,6 +80,27 @@ static std::vector<double> run_kernel(NFDRS4& nf, const std::vector<double>& pin
             o[d] = nf.KBDI * 0.254;
         }
     }
+}
+
+static std::vector<double> run_kernel(NFDRS4& nf, const std::vector<double>& pin,
+                                      const std::vector<double>& tf, const std::vector<double>& map_in,
+                                      size_t cells, size_t days) {
+    std::vector<double> out(cells * days);
+    run_cells(nf, pin, tf, map_in, 0, cells, days, out);
+    return out;
+}
+
+// harness-level parallelism (not an NFDRS4 feature): contiguous cell blocks, one
+// NFDRS4 object per thread (iCalcKBDI keeps no shared state), threads spawned per call
+static std::vector<double> run_kernel_mt(std::vector<NFDRS4>& nfs, const std::vector<double>& pin,
+                                         const std::vector<double>& tf, const std::vector<double>& map_in,
+                                         size_t cells, size_t days) {
+    std::vector<double> out(cells * days);
+    size_t n = nfs.size();
+    std::vector<std::thread> pool;
+    for (size_t k = 0; k < n; k++)
+        pool.emplace_back([&, k] { run_cells(nfs[k], pin, tf, map_in, k * cells / n, (k + 1) * cells / n, days, out); });
+    for (auto& th : pool) th.join();
     return out;
 }
 
@@ -135,12 +156,14 @@ static std::vector<double> run_api_hourly(const std::vector<double>& pin, const 
 
 int main(int argc, char** argv) {
     std::string workload, variant = "kernel", timings = "out/timings.jsonl", values;
+    size_t threads = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
         std::string f = argv[i], v = argv[i + 1];
         if (f == "--workload") workload = v;
         else if (f == "--variant") variant = v;
         else if (f == "--timings") timings = v;
         else if (f == "--values") values = v;
+        else if (f == "--threads") threads = (size_t)std::strtoull(v.c_str(), nullptr, 10);
         else { std::fprintf(stderr, "unknown flag %s\n", f.c_str()); return 2; }
     }
     if (workload.empty()) { std::fprintf(stderr, "--workload is required\n"); return 2; }
@@ -156,15 +179,20 @@ int main(int argc, char** argv) {
     wname = wname.substr(wname.find_last_of("/\\") + 1);
 
     NFDRS4 kernel_obj;  // used by the kernel variant only
+    if (variant != "kernel_mt") threads = 1;
+    threads = std::max<size_t>(1, std::min(threads, cells));
+    std::vector<NFDRS4> mt_objs(variant == "kernel_mt" ? threads : 0);
     std::string notes;
     auto call = [&]() -> std::vector<double> {
         if (variant == "kernel") return run_kernel(kernel_obj, pin, tf, map_in, cells, days);
+        if (variant == "kernel_mt") return run_kernel_mt(mt_objs, pin, tf, map_in, cells, days);
         if (variant == "api") return run_api(pin, tf, map_in, dates, cells, days);
         if (variant == "api_hourly") return run_api_hourly(pin, tf, map_in, dates, cells, days);
         std::fprintf(stderr, "unknown variant %s\n", variant.c_str());
         std::exit(2);
     };
     if (variant == "kernel") notes = "NFDRS4::iCalcKBDI (public) driven per day, state in public members; start KBDI 0 via SetStartKBDI(0); int KBDI hundredths of inch";
+    else if (variant == "kernel_mt") notes = "kernel on contiguous cell blocks, one NFDRS4 object and one std::thread per block, spawned per call (harness-level parallelism)";
     else if (variant == "api") notes = "NFDRS4::UpdateDaily per day, one object per cell built inside the timed call; extra: live fuel moisture, load transfer, SC/ERC/BI/IC";
     else notes = "NFDRS4::Update hourly, 24 calls/day, one object per cell built inside the timed call; extra: Nelson dead fuel moisture, live FM, indices every hour";
     auto checksum = [](const std::vector<double>& v) { double s = 0; for (double x : v) s += x; return s; };
@@ -202,7 +230,7 @@ int main(int argc, char** argv) {
     }
     std::ostringstream line;
     line << "{\"impl\": \"nfdrs4\", \"variant\": \"" << variant << "\", \"workload\": \"" << wname
-         << "\", \"cells\": " << cells << ", \"days\": " << days << ", \"threads\": 1, \"samples_ns\": [";
+         << "\", \"cells\": " << cells << ", \"days\": " << days << ", \"threads\": " << threads << ", \"samples_ns\": [";
     for (size_t i = 0; i < samples.size(); i++) line << (i ? "," : "") << samples[i];
     line.precision(17);
     line << "], \"first_call_ns\": " << first_ns << ", \"checksum\": " << sum << ", \"notes\": \"" << notes << "\"}\n";
