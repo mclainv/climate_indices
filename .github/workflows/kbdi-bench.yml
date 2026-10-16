@@ -11,7 +11,7 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       K: repo/benchmarks/kbdi_competitors
       KBDI_NO_CPU_WORKAROUND: "1"  # the generic-CPU numba workaround is for Snapdragon only
@@ -66,6 +66,24 @@ jobs:
         run: |
           venv/bin/pip install -q xclim==0.62.0 numba==0.68.0 llvmlite==0.50.0 numpy==2.4.6 xarray==2026.9.0 pandas==3.0.6 scipy==1.18.1 dask==2026.8.0
           venv/bin/python -m numba -s | grep -iE "svml|cpu name|cpu features" || true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build competitors (pinned as on the laptop)
+        run: |
+          W="$GITHUB_WORKSPACE"
+          git clone -q https://github.com/alpineworks/firewx src/firewx
+          git -C src/firewx checkout -q 0439036ae81c29d11c6837c7d083666add5a37a0
+          (cd "$K/firewx" && go mod edit -replace "alpineworks.io/firewx=$W/src/firewx" -replace "alpineworks.io/firewx/nfdrs=$W/src/firewx/nfdrs" && CGO_ENABLED=0 go build -o "$W/bin/firewx" .)
+          git clone -q https://github.com/firelab/NFDRS4 src/NFDRS4
+          git -C src/NFDRS4 checkout -q 69d9bab727174371950d011e6af0ab00ca837cf1
+          cmake -S "$K/nfdrs4" -B build-nfdrs4 -DCMAKE_BUILD_TYPE=Release -DNFDRS4_SRC="$W/src/NFDRS4" > /dev/null
+          cmake --build build-nfdrs4 --target bench -j "$(nproc)" > /dev/null
+          # the shipped kernel (monocongo main), the old bar on the graphics
+          cargo build --release --manifest-path "$K/climate_indices_rust/Cargo.toml" --target-dir build-ci
+          venv/bin/pip install -q xarray-spatial==0.10.19
+          go version; c++ --version | head -1
       - name: Run
         run: |
           run_xclim() {  # label, then harness args
@@ -84,6 +102,20 @@ jobs:
             for b in $BINS; do for v in cm_lanes8 dm_tiled_256x32; do fast $b $w $v; done; done
             run_xclim plain --workload "$K/data/$w" --variant kernel_threads --threads "$THREADS"
             for b in $BINS; do for v in cm_lanes8_mtp dm_tiled_256x32_mtp; do fast $b $w $v "$THREADS"; done; done
+          done
+      - name: Run competitors (grids, after the prototypes, same VM)
+        run: |
+          comp() {  # label, then command
+            label=$1; shift
+            "$@" --timings out-competitors.jsonl 2>&1 | tail -1 | sed "s/^/[$label] /"
+          }
+          for w in grid_400x3650 grid_2500x3650; do
+            d="$K/data/$w"
+            comp xarray-spatial venv/bin/python "$K/xarray_spatial/harness.py" --workload "$d" --variant kernel_raster
+            comp firewx bin/firewx --workload "$d" --variant kernel_mt
+            comp nfdrs4 build-nfdrs4/bench --workload "$d" --variant kernel
+            comp shipped build-ci/release/kbdi-bench-climate-indices --workload "$d" --variant kernel_mt --threads "$THREADS"
+            comp shipped-1t build-ci/release/kbdi-bench-climate-indices --workload "$d" --variant kernel
           done
       - name: Diagnostics (exp cost per build, output reused)
         run: |
