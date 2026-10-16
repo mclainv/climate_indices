@@ -1,0 +1,17 @@
+[package]
+name = "kbdi-bench-climate-indices"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# standalone: not a member of the repository workspace
+[workspace]
+
+[dependencies]
+climate-core = { path = "../../../crates/climate-core" }
+ndarray = "0.17.2"
+
+# the repository's release profile (Cargo.toml at the root)
+[profile.release]
+lto = "thin"
+codegen-units = 1
