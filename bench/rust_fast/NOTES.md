@@ -145,6 +145,45 @@ What it shows:
   bigger gap than on the laptop, so this rewrite matters more on Linux than the laptop
   suggested.
 
+## AVX2 and mimalloc on the Linux runners (run 38826146655, artifacts in `../out/ci_38826146655/`)
+
+The x86 build with `-C target-cpu=x86-64-v3` (AVX2) is the ceiling of runtime AVX2
+dispatch: 6013 `ymm` instructions, against 0 in the baseline. Output checksums are
+identical across all four x86 builds, so the bits did not change.
+
+x86, AMD EPYC 7763: xclim → best of each build (median)
+
+| workload | xclim | baseline | + mimalloc | AVX2 | AVX2 + mimalloc | best × |
+|---|---|---|---|---|---|---|
+| station_1825 | 24.8 µs | 12.0 | 12.0 | 7.5 | 7.7 | 3.3 |
+| station_10958 | 137.9 µs | 88.7 | 71.5 | 65.3 (min 43.9) | 44.6 | 3.1 |
+| grid_400, 1 thread | 18.3 ms | 6.19 | 6.32 | 4.76 | 3.66 | 5.0 |
+| grid_2500, 1 thread | 119.2 ms | 42.0 | 40.4 | 32.2 | 24.7 | 4.8 |
+| grid_400, 4 threads | 6.09 ms | 3.04 | 3.06 | 2.13 | 1.70 | 3.6 |
+| grid_2500, 4 threads | 36.7 ms | 18.9 | 19.3 | 13.5 | 12.3 | 3.0 |
+
+- **AVX2 cuts the `exp` pass from 23.3 to 14.3 ms** on grid_2500. Stations gain only
+  through the time scan (`cm_scanf8`), whose lanes widen; the short chain (`cm_scalar`)
+  does not change. With AVX2 the scan is worth shipping on x86.
+- **Day-major tiles under AVX2 need mimalloc.** `dm_tiled` with AVX2 got *slower* with
+  the system allocator (grid_2500 55.8 vs 42.0 ms; grid_400 bimodal) and fastest with
+  mimalloc (24.7 ms). `cm_lanes8`, whose loads are scalar, did not care. Likely cause,
+  not yet verified: glibc places large blocks 16 bytes past a page boundary, so every
+  32-byte AVX load splits a cache line, while mimalloc aligns to 64. If that is right,
+  production needs 64-byte-aligned inputs and output for AVX2. The binding already copies
+  the inputs, so it could align them at no extra cost.
+
+ARM, Neoverse-N2 (no AVX2):
+
+| workload | xclim | baseline | + mimalloc | best × |
+|---|---|---|---|---|
+| station_1825 | 21.0 µs | 12.7 | 12.7 | 1.65 |
+| station_10958 | 117.6 µs | 81.0 | 75.4 | 1.56 |
+| grid_400, 1 thread | 15.65 ms | 6.21 | 6.06 | 2.6 |
+| grid_2500, 1 thread | 99.6 ms | 56.0 | 42.1 | 2.4 |
+| grid_400, 4 threads | 4.46 ms | 1.71 | 1.66 | 2.7 |
+| grid_2500, 4 threads | 24.9 ms | 11.8 | 11.4 | 2.2 |
+
 ## Variants (`src/main.rs`, `src/kernels.rs`)
 
 | variant | layout | what |
