@@ -26,6 +26,12 @@ jobs:
           ref: main
           path: repo
           lfs: false
+      - uses: actions/checkout@v4
+        with:
+          repository: mclainv/climate_indices
+          ref: perf/kbdi-fast-path
+          path: fast
+          lfs: false
       - name: Hardware
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket|MHz|Flags" | cut -c1-200
@@ -83,6 +89,13 @@ jobs:
           # the shipped kernel (monocongo main), the old bar on the graphics
           cargo build --release --manifest-path "$K/climate_indices_rust/Cargo.toml" --target-dir build-ci
           venv/bin/pip install -q xarray-spatial==0.10.19
+          # climate_indices with its Rust extension: the release (main) and the fast-path branch
+          for src in repo fast; do
+            python -m venv "vci-$src" && "vci-$src/bin/pip" install -q maturin dask
+            (cd "$src" && "$W/vci-$src/bin/maturin" build --release --interpreter "$W/vci-$src/bin/python" --out "$W/dist-$src" > /dev/null)
+            "vci-$src/bin/pip" install -q "$W"/dist-$src/*.whl
+            "vci-$src/bin/python" -c "import climate_indices, climate_indices._native as n; print('$src', climate_indices.__version__, n.__file__)"
+          done
           go version; c++ --version | head -1
       - name: Run
         run: |
@@ -109,13 +122,28 @@ jobs:
             label=$1; shift
             "$@" --timings out-competitors.jsonl 2>&1 | tail -1 | sed "s/^/[$label] /"
           }
+          # per library: what it offers single-threaded, its Dask path (where it has one),
+          # and our harness-level thread wrapper on all cores
           for w in grid_400x3650 grid_2500x3650; do
             d="$K/data/$w"
+            comp xclim-dask venv/bin/python "$K/xclim/harness.py" --workload "$d" --variant api_dask --threads "$THREADS"
+            comp xclim-api venv/bin/python "$K/xclim/harness.py" --workload "$d" --variant api
             comp xarray-spatial venv/bin/python "$K/xarray_spatial/harness.py" --workload "$d" --variant kernel_raster
-            comp firewx bin/firewx --workload "$d" --variant kernel_mt
+            comp xarray-spatial-threads venv/bin/python "$K/xarray_spatial/harness.py" --workload "$d" --variant kernel_raster_threads --threads "$THREADS"
+            comp firewx bin/firewx --workload "$d" --variant kernel
+            comp firewx-mt bin/firewx --workload "$d" --variant kernel_mt
             comp nfdrs4 build-nfdrs4/bench --workload "$d" --variant kernel
+            comp nfdrs4-mt build-nfdrs4/bench --workload "$d" --variant kernel_mt --threads "$THREADS"
             comp shipped build-ci/release/kbdi-bench-climate-indices --workload "$d" --variant kernel_mt --threads "$THREADS"
             comp shipped-1t build-ci/release/kbdi-bench-climate-indices --workload "$d" --variant kernel
+            for src in repo fast; do
+              for v in api api_xarray; do
+                comp "ci-$src-$v" "vci-$src/bin/python" "$K/climate_indices_python/bench.py" --workload "$d" --variant $v
+              done
+              for v in api_dask api_dask_ignore; do
+                comp "ci-$src-$v" "vci-$src/bin/python" "$K/climate_indices_python/bench.py" --workload "$d" --variant $v --threads "$THREADS"
+              done
+            done
           done
       - name: Diagnostics (exp cost per build, output reused)
         run: |
@@ -128,4 +156,48 @@ jobs:
         if: always()
         with:
           name: timings-${{ matrix.runner }}
+          path: "*.jsonl"
+
+  xarray-spatial-dask:
+    # xrspatial.kbdi is a one-day step; its Dask path chains 3650 one-day graphs,
+    # ~100 s per call, so this runs the harness's --quick protocol (first call,
+    # 2 warm-up calls, 3 samples) in its own job
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      K: repo/benchmarks/kbdi_competitors  # make_inputs.py reads the repository's Fresno fixture
+      KBDI_NO_CPU_WORKAROUND: "1"
+      NUMBA_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bench-src
+      - uses: actions/checkout@v4
+        with:
+          repository: monocongo/climate_indices
+          ref: main
+          path: repo
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Stage
+        run: |
+          mkdir -p "$K" && cp -r bench-src/bench/. "$K/"
+          python -m venv venv
+          venv/bin/pip install -q xarray-spatial==0.10.19 numba==0.68.0 llvmlite==0.50.0 numpy==2.4.6 xarray==2026.9.0 pandas==3.0.6 scipy==1.18.1 dask==2026.8.0
+          venv/bin/python "$K/make_inputs.py"
+      - name: Run (quick protocol)
+        run: |
+          for w in grid_400x3650 grid_2500x3650; do
+            venv/bin/python "$K/xarray_spatial/harness.py" --workload "$K/data/$w" --variant api_raster_dask --threads "$(nproc)" --quick --timings out-xs-dask-quick.jsonl 2>&1 | tail -1
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timings-xs-dask-${{ matrix.runner }}
           path: "*.jsonl"
