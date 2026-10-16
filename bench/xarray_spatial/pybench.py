@@ -37,6 +37,8 @@ def parse_args(variants: list[str]) -> argparse.Namespace:
     ap.add_argument("--variant", default="kernel", choices=variants)
     ap.add_argument("--timings", type=Path, default=Path("out/timings.jsonl"))
     ap.add_argument("--values", type=Path)
+    ap.add_argument("--threads", type=int, default=1,
+                    help="worker threads for variants that support it (e.g. api_dask)")
     ap.add_argument(
         "--quick",
         action="store_true",
@@ -88,14 +90,14 @@ def run_protocol(call, checksum, cells: int, quick: bool):
 
 
 def write_outputs(args, impl, workload, cells, days, samples, first_call_ns,
-                  csum, notes, values_cm):
+                  csum, notes, values_cm, threads=1):
     """`values_cm`: float64 [cell][day] array in mm, or None."""
     if args.values is not None:
         args.values.parent.mkdir(parents=True, exist_ok=True)
         np.ascontiguousarray(values_cm, dtype="<f8").tofile(args.values)
     line = {
         "impl": impl, "variant": args.variant, "workload": workload,
-        "cells": cells, "days": days, "threads": 1, "samples_ns": samples,
+        "cells": cells, "days": days, "threads": threads, "samples_ns": samples,
         "first_call_ns": first_call_ns, "checksum": csum, "notes": notes,
     }
     args.timings.parent.mkdir(parents=True, exist_ok=True)

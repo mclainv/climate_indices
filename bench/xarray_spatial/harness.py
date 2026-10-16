@@ -18,6 +18,15 @@ Variants (single-threaded, numpy-backed; the library computes in float32):
   a single scalar ``annual_precip`` = mean of the per-cell MAP. This does NOT
   reproduce the per-cell MAP inputs, so its values differ from ``kernel``;
   use it only to see raster throughput.
+- ``kernel_raster_threads``: ``kernel_raster`` with the raster's rows split
+  into ``--threads`` contiguous blocks, each block running its whole day loop
+  on its own thread from a persistent ``ThreadPoolExecutor`` (``_kbdi_cpu`` is
+  ``nogil``). Harness-level parallelism, not an xarray-spatial feature.
+- ``api_raster_dask``: ``api_raster`` on per-day DataArrays backed by Dask,
+  rows chunked into ``--threads`` blocks (chunking outside the timed call).
+  The timed call chains ``xrspatial.kbdi`` lazily over every day (the library
+  maps ``_kbdi_cpu`` over the blocks), stacks the days and runs ``.compute()``
+  on Dask's threaded scheduler with ``--threads`` workers.
 """
 
 from __future__ import annotations
@@ -41,7 +50,8 @@ def raster_shape(cells: int) -> tuple[int, int]:
 
 
 def main() -> None:
-    args = pybench.parse_args(["kernel", "api", "kernel_raster", "api_raster"])
+    args = pybench.parse_args(["kernel", "api", "kernel_raster", "api_raster",
+                               "kernel_raster_threads", "api_raster_dask"])
     cells, days, a = pybench.load_workload(
         args.workload, ["precip_mm.bin", "tmax_c.bin", "map_mm.bin"]
     )
@@ -52,6 +62,11 @@ def main() -> None:
     import xrspatial
     from xrspatial.fire import _kbdi_cpu
 
+    threads = args.threads if args.variant in ("kernel_raster_threads", "api_raster_dask") else 1
+    if args.variant == "kernel_raster_threads":
+        return run_threads(args, precip, tmax, pa, cells, days, workload, threads)
+    if args.variant == "api_raster_dask":
+        return run_dask(args, precip, tmax, pa, cells, days, workload, threads)
     use_raster = args.variant.endswith("_raster")
     use_api = args.variant.startswith("api")
     if use_raster:
@@ -116,6 +131,99 @@ def main() -> None:
     )
     pybench.write_outputs(args, "xarray_spatial", workload, cells, days, samples,
                           first_ns, csum, notes, out)
+
+
+def _raster_days(precip, tmax, cells, days):
+    shp = raster_shape(cells)
+    p = np.ascontiguousarray(precip.T.reshape(days, *shp))  # (day, rows, cols)
+    t = np.ascontiguousarray(tmax.T.reshape(days, *shp))
+    return shp, p, t
+
+
+def _finish(args, workload, cells, days, samples, first_ns, csum, hist, threads, how):
+    import numba
+    import xrspatial
+
+    out = np.ascontiguousarray(hist.reshape(days, cells).T, dtype="f8")
+    notes = (
+        f"xarray-spatial {xrspatial.__version__}, numba {numba.__version__}; {how}; "
+        f"one raster, scalar MAP = mean of per-cell MAP (raster throughput only); "
+        f"float32 compute, 800-scale non-standard algorithm (NOT scientifically comparable)"
+    )
+    pybench.write_outputs(args, "xarray_spatial", workload, cells, days, samples,
+                          first_ns, csum, notes, out, threads=threads)
+
+
+def run_threads(args, precip, tmax, pa, cells, days, workload, threads):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from xrspatial.fire import _kbdi_cpu
+
+    shp, p, t = _raster_days(precip, tmax, cells, days)
+    m = float(pa.mean())
+    rows = shp[0]
+    threads = max(1, min(threads, rows))
+    bounds = [(k * rows // threads, (k + 1) * rows // threads) for k in range(threads)]
+    blocks = [
+        ([np.ascontiguousarray(p[d, a:b], dtype="f4") for d in range(days)],
+         [np.ascontiguousarray(t[d, a:b], dtype="f4") for d in range(days)],
+         np.zeros((b - a, shp[1]), dtype="f4"))
+        for a, b in bounds
+    ]
+    pool = ThreadPoolExecutor(threads)
+
+    def block(k, h):
+        a, b = bounds[k]
+        ps, ts, q = blocks[k]
+        for d in range(days):
+            q = _kbdi_cpu(q, ts[d], ps[d], m)
+            h[d, a:b] = q
+
+    def call():
+        h = np.empty((days, *shp), dtype="f4")
+        list(pool.map(block, range(threads), [h] * threads))
+        return h
+
+    def checksum(h):
+        return float(h.sum(dtype="f8"))
+
+    samples, first_ns, csum, last = pybench.run_protocol(call, checksum, cells, args.quick)
+    pool.shutdown()
+    _finish(args, workload, cells, days, samples, first_ns, csum, last, threads,
+            f"_kbdi_cpu per day on {threads} row blocks from a persistent ThreadPoolExecutor")
+
+
+def run_dask(args, precip, tmax, pa, cells, days, workload, threads):
+    import dask
+    import dask.array as da
+    import xrspatial
+
+    shp, p, t = _raster_days(precip, tmax, cells, days)
+    m = float(pa.mean())
+    rows = shp[0]
+    threads = max(1, min(threads, rows))
+    chunk = {"dim_0": -(-rows // threads), "dim_1": -1}
+    ps = [xr.DataArray(p[d]).chunk(chunk) for d in range(days)]
+    ts = [xr.DataArray(t[d]).chunk(chunk) for d in range(days)]
+    q0 = xr.DataArray(np.zeros(shp, dtype="f4")).chunk(chunk)
+    kbdi = xrspatial.kbdi
+
+    def call():
+        q = q0
+        days_out = []
+        for d in range(days):
+            q = kbdi(q, ts[d], ps[d], m)
+            days_out.append(q.data)
+        (h,) = dask.compute(da.stack(days_out), scheduler="threads", num_workers=threads)
+        return h
+
+    def checksum(h):
+        return float(np.asarray(h).sum(dtype="f8"))
+
+    samples, first_ns, csum, last = pybench.run_protocol(call, checksum, cells, args.quick)
+    _finish(args, workload, cells, days, samples, first_ns, csum, np.asarray(last), threads,
+            f"xrspatial.kbdi on Dask DataArrays ({threads} row chunks), lazy over all days, "
+            f"one .compute() on the threaded scheduler with {threads} workers")
 
 
 if __name__ == "__main__":
